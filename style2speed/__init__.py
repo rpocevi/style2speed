@@ -17,6 +17,7 @@ from .preprocessing import (
 
 # Stats
 from .stats import (
+    get_circuit_dominance,
     calc_param_stats,
     calc_significance,
 )

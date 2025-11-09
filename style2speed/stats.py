@@ -1,6 +1,6 @@
 # style2speed/stats.py
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 import warnings
 
 import numpy as np
@@ -10,6 +10,137 @@ from statsmodels.stats.oneway import anova_oneway
 from statsmodels.stats.multitest import multipletests
 
 from style2speed.config import GROUP_COLS, STATS_PARAMS, STATS
+
+
+def get_circuit_dominance(
+    df_tel: pd.DataFrame,
+    driver: int,
+    ref_driver: int,
+    method: str = "avg_speed",          # or 'fastest_lap'
+    df_laptimes: Optional[pd.DataFrame] = None,
+    eps: float = 0.0                    # tolerance in m/s to ignore tiny diffs
+) -> Tuple[pd.Series, List[Tuple[float, float]]]:
+    """
+    Compute driver dominance versus a reference driver along circuit distance.
+
+    This function compares the speed profiles of two drivers and determines
+    which driver is dominant (i.e., faster) at each point along the circuit.
+    Dominance can be computed either from average speed across all laps
+    or from the fastest lap of each driver.
+
+    Args:
+        df_tel (pd.DataFrame): 
+            Telemetry data containing at least 'DriverNumber', 'Distance', 
+            and 'Speed' columns. Optionally includes 'LapNumber' if 
+            `method='fastest_lap'`.
+        driver (int): 
+            Driver number of interest for whom dominance is evaluated.
+        ref_driver (int): 
+            Reference driver number to compare against.
+        method (str): 
+            Circuit dominance evaluation method, either `'avg_speed'` or `'fastest_lap'`.
+            - `'avg_speed'`: Dominance is evaluated based on average speed across all laps.
+            - `'fastest_lap'`: Dominance is evaluated using the fastest lap of each driver.
+        df_laptimes (pd.DataFrame, optional): 
+            Data frame with lap times across drivers and laps. Must include
+            'DriverNumber', 'LapNumber', and 'LapTime' columns.
+            Required if `method == 'fastest_lap'`.
+        eps (float, optional): 
+            Difference in speed (m/s) regarded as a tie, i.e. 
+            |speed_driver − speed_ref| ≤ eps → dominance = 0.5. Default is 0.0.
+
+    Raises:
+        ValueError: If an invalid method is provided.
+        ValueError: If `df_laptimes` is not provided for `'fastest_lap'` method.
+        ValueError: If `df_laptimes` is missing rows for the input drivers.
+        ValueError: If `df_tel` is missing speed values for the input drivers.
+        ValueError: If the input drivers lack sufficient overlapping 
+            'Distance' values for comparison.
+
+    Returns:
+        dominance (pd.Series): 
+            Series indexed by 'Distance' (meters). Values:
+            - 1.0 → `driver` dominates (`speed_driver - speed_ref > eps`)
+            - 0.0 → `ref_driver` dominates (`speed_driver - speed_ref < -eps`)
+            - 0.5 → tie (`|speed_driver - speed_ref| ≤ eps`)
+        dlimits (list[tuple[float, float]]): 
+            List of maximal contiguous distance intervals (start_m, end_m) 
+            where the dominance label is constant.
+    """
+    
+    # --- Check inputs ---
+    if method not in {"avg_speed", "fastest_lap"}:
+        raise ValueError('method must be "avg_speed" or "fastest_lap".')
+    if method == "fastest_lap" and df_laptimes is None:
+        raise ValueError("Provide df_laptimes for fastest_lap method.")
+    
+    # --- Select telemetry rows to compare ---
+    if method == "avg_speed":
+        df = df_tel.loc[
+            df_tel["DriverNumber"].isin([driver, ref_driver]),
+            ["DriverNumber", "Distance", "Speed"]
+        ].copy()
+
+    else:  # fastest_lap
+        def _fastest_lap_num(dn: int) -> int:
+            sub = df_laptimes.loc[df_laptimes["DriverNumber"] == dn]
+            if sub.empty:
+                raise ValueError(f"No df_laptimes rows for driver {dn}.")
+            row = sub.sort_values("LapTime", ascending=True).iloc[0]
+            return int(row["LapNumber"])
+
+        fast_lap = _fastest_lap_num(driver)
+        fast_lap_ref = _fastest_lap_num(ref_driver)
+
+        df = df_tel.loc[
+            ((df_tel["DriverNumber"] == driver) & (df_tel["LapNumber"] == fast_lap)) |
+            ((df_tel["DriverNumber"] == ref_driver) & (df_tel["LapNumber"] == fast_lap_ref)),
+            ["DriverNumber", "Distance", "Speed"]
+        ].copy()
+
+    # --- Aggregate by distance per driver ---
+    df_agg = (
+        df.groupby(["DriverNumber", "Distance"], as_index=False)["Speed"].mean()
+    )
+    df_agg = df_agg.sort_values(["Distance", "DriverNumber"])  # ensure sorted
+
+    # --- Pivot wide & only keep rows where both drivers have a value
+    df_wide = df_agg.pivot(index="Distance", columns="DriverNumber", values="Speed")
+
+    if driver not in df_wide.columns or ref_driver not in df_wide.columns:
+        raise ValueError("One of the drivers has no speed data after aggregation.")
+    
+    df_wide = df_wide[[driver, ref_driver]].dropna().sort_index()
+
+    if df_wide.empty or len(df_wide) < 2:
+        raise ValueError("Insufficient overlapping distance samples for comparison.")
+    
+    # --- Dominance calculation ---
+    # 1: driver is faster
+    # 0: ref_driver is faster
+    # 0.5: tie (speed difference is within eps)
+    delta = df_wide[driver] - df_wide[ref_driver]  # >0 => driver faster
+    dom = pd.Series(np.where(delta > eps, 1.0, np.where(delta < -eps, 0.0, 0.5)),
+                    index=df_wide.index, name="Dominance")
+    
+    # --- Find change points (run-lengths over dominance) ---
+    # Change point is where dominance value differs from previous
+    # Treat ties (0.5) as their own label; they’ll form their own segments.
+    dvals = dom.values
+    change_idx = np.flatnonzero(np.diff(dvals)) + 1
+    split_points = np.r_[0, change_idx, (len(dom) - 1)]  # add start and end
+
+    # --- Construct circuit segments based on dominance
+    distances = dom.index.values
+    dlimits: List[Tuple[float, float]] = []
+    for i in range(len(split_points) - 1):
+        start = distances[split_points[i]]
+        end = distances[split_points[i + 1]]
+        if end < start:
+            continue
+        dlimits.append((float(start), float(end)))
+
+    return dom, dlimits
 
 
 def calc_param_stats(
